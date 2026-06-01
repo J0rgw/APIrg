@@ -1,4 +1,4 @@
-# leagueStudies — Riot API match-v5 reference
+# leagueStudies Riot API match-v5 reference
 
 A single-page technical reference for ingesting League of Legends match data from the Riot public API, aimed at developers building data tools.
 
