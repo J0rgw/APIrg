@@ -1,0 +1,15 @@
+# Design system docs (internal, not for the repo)
+DESIGN.md
+PRODUCT.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Temp / scratch
+_*.png
+*.tmp

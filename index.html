@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Obtener datos de partidas · Riot API match-v5</title>
+<meta name="description" content="Flujo correcto de ingesta con match-v5: de un Riot ID a la timeline minuto a minuto, sin los errores típicos de routing y de eventos.">
+<meta name="color-scheme" content="dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="index.css">
+<script src="js/init.js"></script>
+</head>
+<body>
+<div class="progress" id="progress" aria-hidden="true"></div>
+<div class="wrap">
+
+  <header class="hero frame">
+    <p class="eyebrow"><b>AnalizeLeague</b> <span class="dim">· Data ingestion</span></p>
+    <h1>Obtener datos de partidas con la <em>Riot API</em></h1>
+    <p class="lead">Flujo correcto con <code>match-v5</code> sobre la API pública: de un Riot ID a la timeline minuto a minuto, sin los errores típicos de routing y de eventos.</p>
+
+    <div class="flow">
+      <div class="node">
+        <div class="n">PASO 1</div>
+        <div class="t">Riot ID → PUUID</div>
+        <div class="s">account-v1</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node">
+        <div class="n">PASO 2</div>
+        <div class="t">PUUID → match IDs</div>
+        <div class="s">match-v5 /by-puuid</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node">
+        <div class="n">PASO 3</div>
+        <div class="t">matchId → datos</div>
+        <div class="s">match-v5 /{matchId}</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node">
+        <div class="n">PASO 4</div>
+        <div class="t">matchId → timeline</div>
+        <div class="s">match-v5 /timeline</div>
+      </div>
+    </div>
+  </header>
+
+  <!-- PASO 0 -->
+  <section id="setup">
+    <h2><span class="step">PASO 0 · PREREQUISITOS</span>API key y límites</h2>
+    <p>Toda petición lleva la cabecera <code>X-Riot-Token</code> (preferible) o el query param <code>?api_key=</code>. La <strong>development key</strong> se regenera cada 24 h; para producción se solicita una <strong>personal/production key</strong>.</p>
+    <p class="sub">Límites de la development key: <strong>20 req/s</strong> y <strong>100 req/2 min</strong>. Conviene meter un limitador (token bucket) desde el día uno, porque el coste real de poblar partidas son las dos llamadas por <code>matchId</code> (detalle + timeline).</p>
+    <figure class="code">
+      <figcaption class="code__bar">
+        <span class="code__lang">HTTP</span>
+        <button class="code__copy" type="button" aria-label="Copiar código">Copiar</button>
+      </figcaption>
+      <pre><span class="c-com"># cabecera recomendada</span>
+X-Riot-Token: RGAPI-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</pre>
+    </figure>
+  </section>
+
+  <!-- PASO 1 -->
+  <section id="puuid">
+    <h2><span class="step">PASO 1 · IDENTIDAD</span>Del Riot ID al PUUID</h2>
+    <p>El <code>PUUID</code> es la clave que ata todo el flujo. Se obtiene del Riot ID moderno (<code>gameName#tagLine</code>) mediante <strong>account-v1</strong>. Es global y no cambia aunque el jugador cambie de servidor.</p>
+
+    <div class="endpoint frame">
+      <span class="method">GET</span>
+      <code class="path">/riot/account/v1/accounts/by-riot-id/<b>{gameName}</b>/<b>{tagLine}</b></code>
+      <button class="endpoint__copy" type="button" aria-label="Copiar ruta">Copiar</button>
+    </div>
+
+    <div class="note info">
+      <span class="label">Routing regional, no de servidor</span>
+      <p>account-v1 usa <strong>routing regional</strong> (<code>americas</code> / <code>asia</code> / <code>europe</code>), igual que match-v5, <em>no</em> los platform IDs como <code>euw1</code>. El dato devuelto es idéntico en cualquier cluster; solo cambia la latencia. Usa el más cercano a tu servidor.</p>
+    </div>
+
+    <figure class="code">
+      <figcaption class="code__bar">
+        <span class="code__lang">TypeScript</span>
+        <button class="code__copy" type="button" aria-label="Copiar código">Copiar</button>
+      </figcaption>
+      <pre><span class="c-key">const</span> region = <span class="c-str">"europe"</span>; <span class="c-com">// cluster regional</span>
+<span class="c-key">const</span> res = <span class="c-key">await</span> <span class="c-fn">fetch</span>(
+  <span class="c-str">`https://${region}.api.riotgames.com/riot/account/v1/`</span> +
+  <span class="c-str">`accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`</span>,
+  { headers: { <span class="c-str">"X-Riot-Token"</span>: API_KEY } }
+);
+<span class="c-key">const</span> { puuid } = <span class="c-key">await</span> res.<span class="c-fn">json</span>();</pre>
+    </figure>
+  </section>
+
+  <!-- PASO 2 -->
+  <section id="matchids">
+    <h2><span class="step">PASO 2 · HISTORIAL</span>Del PUUID a los match IDs</h2>
+    <p>Devuelve un array de strings tipo <code>EUW1_7412345678</code>. Es paginado: pides ventanas con <code>start</code> + <code>count</code>, o filtras por rango temporal y cola.</p>
+
+    <div class="endpoint frame">
+      <span class="method">GET</span>
+      <code class="path">/lol/match/v5/matches/by-puuid/<b>{puuid}</b>/ids</code>
+      <button class="endpoint__copy" type="button" aria-label="Copiar ruta">Copiar</button>
+    </div>
+
+    <h3>Query params útiles</h3>
+    <ul class="params">
+      <li><span class="pname">start</span><span class="ptype">int · def 0</span><div class="pdesc">Offset de paginación.</div></li>
+      <li><span class="pname">count</span><span class="ptype">int · def 20 · máx 100</span><div class="pdesc">Tamaño de página. Para ingesta masiva, itera de 100 en 100 subiendo <code>start</code>.</div></li>
+      <li><span class="pname">queue</span><span class="ptype">int</span><div class="pdesc">Filtra por queue ID (p. ej. <code>420</code> = SoloQ ranked, <code>400</code> = normal draft). Útil para excluir ARAM/customs.</div></li>
+      <li><span class="pname">type</span><span class="ptype">string</span><div class="pdesc"><code>ranked</code>, <code>normal</code>, <code>tourney</code>, <code>tutorial</code>.</div></li>
+      <li><span class="pname">startTime / endTime</span><span class="ptype">epoch segundos</span><div class="pdesc">Acota por fecha. Ojo: <strong>segundos</strong>, no milisegundos.</div></li>
+    </ul>
+
+    <figure class="code">
+      <figcaption class="code__bar">
+        <span class="code__lang">Python</span>
+        <button class="code__copy" type="button" aria-label="Copiar código">Copiar</button>
+      </figcaption>
+      <pre><span class="c-key">def</span> <span class="c-fn">get_match_ids</span>(puuid, region=<span class="c-str">"europe"</span>, count=<span class="c-num">100</span>, start=<span class="c-num">0</span>):
+    url = <span class="c-str">f"https://{region}.api.riotgames.com"</span> \
+          <span class="c-str">f"/lol/match/v5/matches/by-puuid/{puuid}/ids"</span>
+    params = {<span class="c-str">"start"</span>: start, <span class="c-str">"count"</span>: count, <span class="c-str">"queue"</span>: <span class="c-num">420</span>}
+    r = requests.<span class="c-fn">get</span>(url, params=params, headers=HEADERS)
+    <span class="c-key">return</span> r.<span class="c-fn">json</span>()  <span class="c-com"># -> ["EUW1_7412345678", ...]</span></pre>
+    </figure>
+  </section>
+
+  <!-- PASO 3 + 4 -->
+  <section id="match">
+    <h2><span class="step">PASO 3 + 4 · DATOS</span>Detalle de partida y timeline</h2>
+    <p>Por cada <code>matchId</code> hay dos recursos distintos. El <strong>detalle</strong> trae el estado final agregado (stats por participante, picks, bans, objetivos). La <strong>timeline</strong> trae la evolución temporal: snapshots por minuto y eventos puntuales.</p>
+
+    <div class="endpoint frame">
+      <span class="method">GET</span>
+      <code class="path">/lol/match/v5/matches/<b>{matchId}</b></code>
+      <button class="endpoint__copy" type="button" aria-label="Copiar ruta">Copiar</button>
+    </div>
+    <p class="sub">Estructura: <code>metadata</code> (lista de PUUIDs) + <code>info</code> (los <code>participants[]</code> con KDA, oro, daño, items, runas; y <code>teams[]</code> con bans y objetivos). El orden de <code>participants</code> es el mismo en todo el JSON.</p>
+
+    <div class="endpoint frame">
+      <span class="method">GET</span>
+      <code class="path">/lol/match/v5/matches/<b>{matchId}</b>/timeline</code>
+      <button class="endpoint__copy" type="button" aria-label="Copiar ruta">Copiar</button>
+    </div>
+    <p class="sub">Estructura: <code>info.frames[]</code>, un frame por minuto. Cada frame tiene <code>participantFrames</code> (posición, oro, XP, CS total y CS de jungla, nivel) y <code>events[]</code> (sucesos con timestamp en ms).</p>
+
+    <figure class="code">
+      <figcaption class="code__bar">
+        <span class="code__lang">TypeScript</span>
+        <button class="code__copy" type="button" aria-label="Copiar código">Copiar</button>
+      </figcaption>
+      <pre><span class="c-com">// Las dos llamadas por matchId</span>
+<span class="c-key">const</span> base = <span class="c-str">`https://${region}.api.riotgames.com/lol/match/v5/matches`</span>;
+
+<span class="c-key">const</span> detail   = <span class="c-key">await</span> (<span class="c-key">await</span> <span class="c-fn">fetch</span>(<span class="c-str">`${base}/${matchId}`</span>,          { headers })).<span class="c-fn">json</span>();
+<span class="c-key">const</span> timeline = <span class="c-key">await</span> (<span class="c-key">await</span> <span class="c-fn">fetch</span>(<span class="c-str">`${base}/${matchId}/timeline`</span>, { headers })).<span class="c-fn">json</span>();</pre>
+    </figure>
+  </section>
+
+  <!-- ROUTING -->
+  <section id="routing">
+    <h2><span class="step">CLAVE #1</span>Routing: región ≠ servidor</h2>
+    <p>El error nº 1. El sufijo de <code>EUW1_…</code> en un matchId es un <em>platform ID</em>, pero match-v5 y account-v1 se consultan contra el <strong>cluster regional</strong> que lo engloba. Si pegas a <code>euw1.api…</code> para match-v5, falla.</p>
+    <table>
+      <thead><tr><th scope="col">Cluster regional</th><th scope="col">Platform IDs (servidores)</th></tr></thead>
+      <tbody>
+        <tr><td class="mono region">americas</td><td class="mono">na1 · br1 · la1 · la2</td></tr>
+        <tr><td class="mono region">europe</td><td class="mono">euw1 · eun1 · tr1 · ru · me1</td></tr>
+        <tr><td class="mono region">asia</td><td class="mono">kr · jp1</td></tr>
+        <tr><td class="mono region">sea</td><td class="mono">oc1 · ph2 · sg2 · th2 · tw2 · vn2</td></tr>
+      </tbody>
+    </table>
+    <p class="sub">Regla práctica: para todo lo de <strong>match-v5</strong> y <strong>account-v1</strong> usa el cluster (americas/europe/asia/sea). Los platform IDs solo aparecen en endpoints legacy como summoner-v4 o league-v4.</p>
+  </section>
+
+  <!-- EVENTOS -->
+  <section id="eventos">
+    <h2><span class="step">CLAVE #2</span>Qué hay (y qué no) en la timeline</h2>
+    <p>El error nº 2, y el más caro porque <strong>pasa silenciosamente</strong>: asumir eventos que la API no emite. La timeline tiene un conjunto cerrado de tipos en <code>events[].type</code>. Estos sí existen:</p>
+
+    <div class="events">
+      <div class="ev yes">CHAMPION_KILL</div>
+      <div class="ev yes">CHAMPION_SPECIAL_KILL</div>
+      <div class="ev yes">BUILDING_KILL</div>
+      <div class="ev yes">TURRET_PLATE_DESTROYED</div>
+      <div class="ev yes">ELITE_MONSTER_KILL</div>
+      <div class="ev yes">WARD_PLACED / WARD_KILL</div>
+      <div class="ev yes">ITEM_PURCHASED / _SOLD / _DESTROYED / _UNDO</div>
+      <div class="ev yes">SKILL_LEVEL_UP</div>
+      <div class="ev yes">LEVEL_UP</div>
+      <div class="ev yes">GAME_END · PAUSE_END</div>
+    </div>
+
+    <div class="note warn">
+      <span class="label">Trampa de la jungla</span>
+      <p>No existe <code>MONSTER_KILL</code> para campamentos normales. Gromp, krugs, raptors, lobos y los <strong>buffs azul/rojo no generan ningún evento</strong> en la timeline. Riot llegó a emitir los buffs en su día y los retiró a propósito (evitar exponer rutas y counter-jungla). Lo único que llega como evento de monstruo es <code>ELITE_MONSTER_KILL</code>: dragones, Barón, Heraldo, Grubs/Voidgrubs y Atakhan.</p>
+    </div>
+
+    <p>Filtrar la ruta de jungla por un tipo de evento que no se emite "funciona" contra fixtures inventados y devuelve vacío contra datos reales. La ruta de campamentos no se lee de <code>events</code>: se <strong>infiere de los snapshots</strong>.</p>
+
+    <figure class="code">
+      <figcaption class="code__bar">
+        <span class="code__lang">Python</span>
+        <button class="code__copy" type="button" aria-label="Copiar código">Copiar</button>
+      </figcaption>
+      <pre><span class="c-com"># Reconstrucción de jungla SIN eventos: deltas de CS de jungla por frame</span>
+<span class="c-key">for</span> i, frame <span class="c-key">in</span> <span class="c-fn">enumerate</span>(timeline[<span class="c-str">"info"</span>][<span class="c-str">"frames"</span>]):
+    pf = frame[<span class="c-str">"participantFrames"</span>][<span class="c-str">str</span>(jungler_id)]
+    cs_jungla = pf[<span class="c-str">"jungleMinionsKilled"</span>]   <span class="c-com"># acumulado</span>
+    pos       = pf[<span class="c-str">"position"</span>]                 <span class="c-com"># {x, y} para inferir el lado</span>
+    <span class="c-com"># delta vs frame anterior + posición -> qué cuadrante farmeó ese minuto</span></pre>
+    </figure>
+
+    <p class="sub">Para objetivos épicos sí usa los eventos: <code>ELITE_MONSTER_KILL</code> trae <code>monsterType</code>, <code>monsterSubType</code> (tipo de dragón), <code>killerId</code> y <code>position</code>, que es justo lo que quieres para timings y control de objetivos.</p>
+  </section>
+
+  <!-- IDENTIFICADORES -->
+  <section id="ids">
+    <h2><span class="step">CLAVE #3</span>IDs numéricos → nombres</h2>
+    <p>Casi todo lo que identifica contenido viene como entero: <code>championId</code> en picks, los IDs de campeón en <code>bans</code>, <code>queueId</code>, items, etc. Para mostrarlos legibles hay que resolverlos contra <strong>Data Dragon</strong> (versionado por parche) o Community Dragon.</p>
+    <figure class="code">
+      <figcaption class="code__bar">
+        <span class="code__lang">JavaScript</span>
+        <button class="code__copy" type="button" aria-label="Copiar código">Copiar</button>
+      </figcaption>
+      <pre><span class="c-com">// Mapa championId -> nombre (cachéalo por versión de parche)</span>
+<span class="c-key">const</span> v = <span class="c-str">"15.11.1"</span>; <span class="c-com">// última de ddragon/api/versions.json</span>
+<span class="c-key">const</span> data = <span class="c-key">await</span> (<span class="c-key">await</span> <span class="c-fn">fetch</span>(
+  <span class="c-str">`https://ddragon.leagueoflegends.com/cdn/${v}/data/es_ES/champion.json`</span>)).<span class="c-fn">json</span>();
+<span class="c-key">const</span> byId = <span class="c-key">new</span> <span class="c-fn">Map</span>(
+  Object.<span class="c-fn">values</span>(data.data).<span class="c-fn">map</span>(c => [<span class="c-fn">Number</span>(c.key), c.name])
+);
+byId.<span class="c-fn">get</span>(<span class="c-num">266</span>); <span class="c-com">// -> "Aatrox"</span></pre>
+    </figure>
+    <p class="sub">Guarda el mapa por parche: los IDs son estables, pero resolver nombres en cada request es trabajo tirado.</p>
+  </section>
+
+  <footer>
+    <p>Referencia: <a href="https://developer.riotgames.com" target="_blank" rel="noopener">developer.riotgames.com</a> · match-v5 / account-v1 · Data Dragon</p>
+    <p>modo demo (Riot API)</p>
+  </footer>
+
+</div>
+
+<script src="js/main.js"></script>
+</body>
+</html>
